@@ -2534,7 +2534,7 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                 int kv_offset = (int)((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
                 size_t layer_kv_offset = (size_t)layer * ctx->kv_cache_max * kv_dim * kv_elem_size;
                 int window = VOX_DEC_WINDOW;
-                int q_pos_val = ctx->kv_pos_offset + pos;
+                int q_pos_val = pos;
                 size_t off_k = (size_t)q_dim * sizeof(float);
                 size_t off_v = (size_t)(q_dim + kv_dim) * sizeof(float);
 
@@ -3390,7 +3390,7 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
                 [enc_cmd memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
                 /* Batched attention (using encoder_attention kernel with head_dim=128) */
-                int q_offset_val = ctx->kv_pos_offset + start_pos;
+                int q_offset_val = start_pos;
                 size_t layer_kv_offset = (size_t)layer * ctx->kv_cache_max * kv_dim * kv_elem_size;
                 [enc_cmd setComputePipelineState:kv_fp16 ?
                     g_encoder_attention_kv_f16_qstrided_pipeline :
