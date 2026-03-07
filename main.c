@@ -17,21 +17,27 @@
 #include <signal.h>
 #include <unistd.h>
 #include <math.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <errno.h>
+#include <ctype.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
+#define SERVER_BUF_SIZE 65536
 
-/* SIGINT handler for clean exit from --from-mic */
+/* SIGINT handler for clean exit */
 static volatile sig_atomic_t mic_interrupted = 0;
 static void sigint_handler(int sig) { (void)sig; mic_interrupted = 1; }
 
 static void usage(const char *prog) {
     fprintf(stderr, "voxtral.c — Voxtral Realtime 4B speech-to-text\n\n");
-    fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin | --from-mic) [options]\n\n", prog);
+    fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin | --from-mic | --server <port>) [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d <dir>      Model directory (with consolidated.safetensors, tekken.json)\n");
     fprintf(stderr, "  -i <file>     Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
     fprintf(stderr, "  --from-mic    Capture from default microphone (macOS only, Ctrl+C to stop)\n");
+    fprintf(stderr, "  --server <p>  Start HTTP server on port <p> (POST audio body, raw text response)\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -I <secs>     Encoder processing interval in seconds (default: 2.0)\n");
     fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
@@ -117,12 +123,284 @@ static void feed_and_drain(vox_stream_t *s, const float *samples, int n_samples)
     }
 }
 
+/* ==========================================================================
+ * Server Implementation
+ * ========================================================================== */
+
+/* Case-insensitive string search */
+static char *strcasestr_custom(const char *haystack, const char *needle) {
+    if (!*needle) return (char *)haystack;
+    for (; *haystack; haystack++) {
+        if (toupper((unsigned char)*haystack) == toupper((unsigned char)*needle)) {
+            const char *h, *n;
+            for (h = haystack, n = needle; *h && *n; h++, n++) {
+                if (toupper((unsigned char)*h) != toupper((unsigned char)*n)) break;
+            }
+            if (!*n) return (char *)haystack;
+        }
+    }
+    return NULL;
+}
+
+struct stream_state {
+    vox_stream_t *s;
+    int client_fd;
+    int first_token;
+    int client_gone;
+};
+
+static void drain_tokens_client(struct stream_state *st) {
+    if (st->client_gone) return;
+    const char *tokens[64];
+    int n;
+    while ((n = vox_stream_get(st->s, tokens, 64)) > 0) {
+        for (int i = 0; i < n; i++) {
+            const char *t = tokens[i];
+            if (st->first_token) {
+                while (*t == ' ') t++;
+                st->first_token = 0;
+            }
+            size_t len = strlen(t);
+            if (len > 0 && send(st->client_fd, t, len, 0) < 0) {
+                st->client_gone = 1;
+                return;
+            }
+        }
+    }
+}
+
+static void handle_client(int client_fd, vox_ctx_t *ctx, float interval) {
+    char buf[SERVER_BUF_SIZE];
+    int nread;
+
+    /* 1. Read HTTP headers */
+    int body_start = 0, total_read = 0;
+    long content_length = -1;
+
+    while ((nread = recv(client_fd, buf + total_read, sizeof(buf) - total_read - 1, 0)) > 0) {
+        total_read += nread;
+        buf[total_read] = 0;
+        char *end = strstr(buf, "\r\n\r\n");
+        if (end) {
+            body_start = (int)(end - buf) + 4;
+            char *cl_ptr = strcasestr_custom(buf, "Content-Length:");
+            if (cl_ptr && cl_ptr < end) content_length = atol(cl_ptr + 15);
+            break;
+        }
+        if (total_read >= (int)sizeof(buf) - 1) break;
+    }
+
+    if (nread <= 0 && total_read == 0) { close(client_fd); return; }
+
+    /* 2. Validate HTTP method */
+    if (strncmp(buf, "OPTIONS ", 8) == 0) {
+        const char *cors = "HTTP/1.1 204 No Content\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: POST\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n\r\n";
+        send(client_fd, cors, strlen(cors), 0);
+        close(client_fd);
+        return;
+    }
+    if (strncmp(buf, "POST ", 5) != 0) {
+        const char *err = "HTTP/1.1 405 Method Not Allowed\r\n"
+            "Allow: POST\r\nConnection: close\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        close(client_fd);
+        return;
+    }
+
+    fprintf(stderr, "[server] headers parsed: content_length=%ld body_start=%d total_read=%d\n",
+            content_length, body_start, total_read);
+
+    /* 3. Handle Expect: 100-continue */
+    {
+        char *hdr_end = buf + body_start;
+        char *ep = strcasestr_custom(buf, "Expect:");
+        if (ep && ep < hdr_end && strcasestr_custom(ep, "100-continue")) {
+            fprintf(stderr, "[server] sending 100 Continue\n");
+            const char *cont = "HTTP/1.1 100 Continue\r\n\r\n";
+            send(client_fd, cont, strlen(cont), 0);
+        }
+    }
+
+    fprintf(stderr, "[server] receiving body into temp file...\n");
+
+    /* 4. Receive entire body into temp file.
+     * This must complete before we start sending the response, otherwise
+     * a TCP deadlock can occur: send() blocks because the client hasn't
+     * finished uploading and isn't reading yet, while recv() can't drain
+     * the upload because we're stuck in send(). */
+    char tmppath[] = "/tmp/voxtral_XXXXXX";
+    int tmpfd = mkstemp(tmppath);
+    if (tmpfd < 0) {
+        const char *err = "HTTP/1.1 500 Internal Server Error\r\n"
+            "Connection: close\r\n\r\nFailed to create temp file\n";
+        send(client_fd, err, strlen(err), 0);
+        close(client_fd);
+        return;
+    }
+
+    int body_in_buf = total_read - body_start;
+    if (body_in_buf > 0) write(tmpfd, buf + body_start, body_in_buf);
+    long body_read = body_in_buf;
+
+    while (1) {
+        if (content_length >= 0 && body_read >= content_length) break;
+        nread = recv(client_fd, buf, sizeof(buf), 0);
+        if (nread <= 0) break;
+        write(tmpfd, buf, nread);
+        body_read += nread;
+    }
+    close(tmpfd);
+    fprintf(stderr, "[server] body received: %ld bytes -> %s\n", body_read, tmppath);
+
+    if (body_read == 0) {
+        unlink(tmppath);
+        const char *err = "HTTP/1.1 400 Bad Request\r\n"
+            "Connection: close\r\n\r\nEmpty body\n";
+        send(client_fd, err, strlen(err), 0);
+        close(client_fd);
+        return;
+    }
+
+    /* 5. Convert audio to raw s16le 16kHz mono via ffmpeg.
+     * This handles any input format (WAV, OGG, MP3, FLAC, etc.)
+     * and any sample rate or channel count. */
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "ffmpeg -i '%s' -f s16le -ar 16000 -ac 1 pipe:1 2>/dev/null", tmppath);
+    fprintf(stderr, "[server] running: %s\n", cmd);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        unlink(tmppath);
+        const char *err = "HTTP/1.1 500 Internal Server Error\r\n"
+            "Connection: close\r\n\r\nFailed to start ffmpeg\n";
+        send(client_fd, err, strlen(err), 0);
+        close(client_fd);
+        return;
+    }
+
+    /* 6. Send HTTP 200 response (client has finished uploading) */
+    const char *response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                           "Cache-Control: no-cache\r\nConnection: close\r\n"
+                           "Access-Control-Allow-Origin: *\r\n\r\n";
+    send(client_fd, response, strlen(response), 0);
+
+    fprintf(stderr, "[server] ffmpeg started, sending 200 OK\n");
+
+    /* 7. Initialize stream */
+    vox_stream_t *s = vox_stream_init(ctx);
+    if (!s) { pclose(fp); unlink(tmppath); close(client_fd); return; }
+    if (interval > 0) vox_set_processing_interval(s, interval);
+
+    fprintf(stderr, "[server] processing audio...\n");
+
+    /* 8. Read PCM from ffmpeg, feed to stream, send tokens */
+    struct stream_state st = { s, client_fd, 1, 0 };
+    long pcm_bytes_total = 0;
+    int chunk_count = 0;
+    int16_t pcm[4096];
+    float fbuf[4096];
+    size_t n;
+    fprintf(stderr, "[server] entering fread loop\n");
+    while (1) {
+        chunk_count++;
+        if (chunk_count <= 20 || chunk_count % 50 == 0)
+            fprintf(stderr, "[server] chunk %d: calling fread...\n", chunk_count);
+        n = fread(pcm, sizeof(int16_t), 4096, fp);
+        if (n == 0) break;
+        for (size_t i = 0; i < n; i++)
+            fbuf[i] = pcm[i] / 32768.0f;
+        pcm_bytes_total += n * 2;
+        if (chunk_count <= 20 || chunk_count % 50 == 0)
+            fprintf(stderr, "[server] chunk %d: fread got %zu samples (%.1f sec total), feeding...\n",
+                    chunk_count, n, (double)pcm_bytes_total / 2.0 / 16000.0);
+        vox_stream_feed(s, fbuf, (int)n);
+        if (chunk_count <= 20 || chunk_count % 50 == 0)
+            fprintf(stderr, "[server] chunk %d: feed done, draining...\n", chunk_count);
+        drain_tokens_client(&st);
+        /* Probe connection: recv returns 0 on client close */
+        if (!st.client_gone) {
+            char probe;
+            int r = recv(client_fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (r == 0) st.client_gone = 1;
+        }
+        if (st.client_gone) {
+            fprintf(stderr, "[server] client disconnected, aborting\n");
+            break;
+        }
+    }
+    fprintf(stderr, "[server] fread loop exited at chunk %d\n", chunk_count);
+    fprintf(stderr, "[server] ffmpeg done, read %ld PCM bytes (%.1f sec audio)\n",
+            pcm_bytes_total, (double)pcm_bytes_total / 2.0 / 16000.0);
+    pclose(fp);
+
+    if (!st.client_gone) {
+        fprintf(stderr, "[server] finishing stream...\n");
+        vox_stream_finish(s);
+        drain_tokens_client(&st);
+    }
+    fprintf(stderr, "[server] done, cleaning up\n");
+
+    unlink(tmppath);
+    vox_stream_free(s);
+    close(client_fd);
+    if (vox_verbose) fprintf(stderr, "Client disconnected.\n");
+}
+
+static void run_server(int port, const char *model_dir, float interval) {
+    int server_fd, client_fd;
+    struct sockaddr_in address;
+    int opt = 1;
+
+    fprintf(stderr, "Loading model from %s...\n", model_dir);
+    vox_ctx_t *ctx = vox_load(model_dir);
+    if (!ctx) exit(1);
+
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) { perror("socket"); exit(1); }
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_NOSIGPIPE
+    setsockopt(server_fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#else
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) { perror("bind"); exit(1); }
+    if (listen(server_fd, 3) < 0) { perror("listen"); exit(1); }
+
+    fprintf(stderr, "Server listening on port %d\n", port);
+
+    while (!mic_interrupted) {
+        socklen_t addrlen = sizeof(address);
+        if ((client_fd = accept(server_fd, (struct sockaddr *)&address, &addrlen)) < 0) {
+            if (errno == EINTR) break;
+            continue;
+        }
+        if (vox_verbose) fprintf(stderr, "New connection.\n");
+        handle_client(client_fd, ctx, interval);
+    }
+
+    vox_free(ctx);
+    close(server_fd);
+}
+
+/* ==========================================================================
+ * Main
+ * ========================================================================== */
+
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *input_wav = NULL;
     int verbosity = 1; /* 0=silent, 1=normal, 2=debug */
     int use_stdin = 0;
     int use_mic = 0;
+    int server_port = -1;
     float interval = -1.0f; /* <0 means use default */
 
     for (int i = 1; i < argc; i++) {
@@ -149,6 +427,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--monitor") == 0) {
             extern int vox_monitor;
             vox_monitor = 1;
+        } else if (strcmp(argv[i], "--server") == 0 && i + 1 < argc) {
+            server_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -163,7 +443,39 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!model_dir || (!input_wav && !use_stdin && !use_mic)) {
+    if (!model_dir) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    /* Server mode */
+    if (server_port > 0) {
+        if (input_wav || use_stdin || use_mic) {
+            fprintf(stderr, "Error: --server cannot be used with -i, --stdin, or --from-mic\n");
+            return 1;
+        }
+        vox_verbose = verbosity;
+        vox_verbose_audio = (verbosity >= 2) ? 1 : 0;
+#ifdef USE_METAL
+        vox_metal_init();
+#endif
+        /* Install SIGINT handler */
+        struct sigaction sa;
+        sa.sa_handler = sigint_handler;
+        sa.sa_flags = 0;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+
+        run_server(server_port, model_dir, interval);
+
+#ifdef USE_METAL
+        vox_metal_shutdown();
+#endif
+        return 0;
+    }
+
+    /* Standard CLI mode */
+    if (!input_wav && !use_stdin && !use_mic) {
         usage(argv[0]);
         return 1;
     }
