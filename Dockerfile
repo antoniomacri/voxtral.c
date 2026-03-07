@@ -29,17 +29,11 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
 # Copy the binary and the download script from the builder stage
-COPY --from=builder /app/voxtral .
-COPY --from=builder /app/download_model.sh .
-
-# Ensure the download script is executable
-RUN chmod +x download_model.sh
+COPY --from=builder /app/voxtral /usr/local/bin/voxtral
 
 # Set the entrypoint to the application
-ENTRYPOINT ["./voxtral"]
+ENTRYPOINT ["voxtral"]
 
 # Default command (prints help)
 CMD ["--help"]
