@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <ctype.h>
+#include <sys/stat.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 #define SERVER_BUF_SIZE 65536
@@ -391,6 +392,53 @@ static void run_server(int port, const char *model_dir, float interval) {
 }
 
 /* ==========================================================================
+ * Auto-download model if missing
+ * ========================================================================== */
+
+#define HF_BASE_URL "https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602/resolve/main/"
+
+static const char *model_files[] = {
+    "consolidated.safetensors",
+    "params.json",
+    "tekken.json",
+};
+#define N_MODEL_FILES (sizeof(model_files) / sizeof(model_files[0]))
+
+static int ensure_model(const char *model_dir) {
+    if (mkdir(model_dir, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Error: cannot create directory %s: %s\n",
+                model_dir, strerror(errno));
+        return -1;
+    }
+
+    for (int i = 0; i < (int)N_MODEL_FILES; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", model_dir, model_files[i]);
+        if (access(path, F_OK) == 0) continue;
+
+        char tmp[1024];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+            "curl -L --progress-bar -o '%s' '%s%s'",
+            tmp, HF_BASE_URL, model_files[i]);
+
+        fprintf(stderr, "Downloading %s...\n", model_files[i]);
+        if (system(cmd) != 0) {
+            fprintf(stderr, "Error: failed to download %s\n", model_files[i]);
+            unlink(tmp);
+            return -1;
+        }
+        if (rename(tmp, path) != 0) {
+            fprintf(stderr, "Error: rename failed: %s\n", strerror(errno));
+            unlink(tmp);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ==========================================================================
  * Main
  * ========================================================================== */
 
@@ -447,6 +495,8 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
+
+    if (ensure_model(model_dir) != 0) return 1;
 
     /* Server mode */
     if (server_port > 0) {
