@@ -4,7 +4,6 @@ FROM debian:bookworm-slim AS builder
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
-    libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,18 +11,16 @@ WORKDIR /app
 # Copy source code
 COPY . .
 
-# Build the application using OpenBLAS backend
-RUN make blas
+# Build with AVX-512 BF16 backend (AMD Zen 4+/Intel SPR+, no OpenBLAS needed)
+RUN make avx512
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
-# libopenblas0: BLAS math library
 # curl, ca-certificates: model auto-download
 # ffmpeg: audio format conversion (used by --server mode)
 RUN apt-get update && apt-get install -y \
-    libopenblas0 \
     curl \
     ca-certificates \
     ffmpeg \
