@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy source code
-COPY . .
+# Copy only the source files needed for building
+COPY Makefile *.c *.h ./
 
 # Build with AVX-512 BF16 backend (AMD Zen 4+/Intel SPR+, no OpenBLAS needed)
 RUN make avx512
